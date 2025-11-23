@@ -1,6 +1,9 @@
 // server.js
 // DeepSeek + uploaded DOCX/PDF -> Full HTML generator
-// Uses: express, multer, cheerio, mammoth, optional pdf-parse, sanitize-html
+// Uses: express, multer (diskStorage to preserve ext), cheerio, mammoth, optional pdf-parse, adm-zip, sanitize-html
+//
+// npm install express multer cheerio mammoth sanitize-html node-fetch adm-zip
+// optional: npm i pdf-parse
 
 const express = require('express');
 const multer = require('multer');
@@ -11,56 +14,54 @@ const fetch = require('node-fetch');
 const cheerio = require('cheerio');
 const sanitizeHtml = require('sanitize-html');
 const mammoth = require('mammoth');
+const AdmZip = require('adm-zip');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Multer upload folder
-const upload = multer({ dest: 'uploads/' });
+// ------------------ CONFIG ------------------
+// Uploads directory
+const UPLOAD_DIR = path.resolve(__dirname, 'uploads');
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// Default fallback file path you used on server (change if needed)
-const DEFAULT_UPLOADED_FILE_PATH = '/mnt/data/CV Aiman.pdf';
+// DEFAULT fallback file path (change to whichever file you want by default)
+// Developer note: using the path observed in your uploads history.
+const DEFAULT_UPLOADED_FILE_PATH = '/mnt/data/aasss.pdf';
 
-// Try to require pdf-parse optionally
+// Optional pdf-parse (install only if you need PDF extraction)
 let pdfParse;
 try {
   pdfParse = require('pdf-parse');
-  console.log('pdf-parse available: will attempt PDF extraction if needed.');
+  console.log('pdf-parse is available: PDF extraction enabled.');
 } catch (e) {
-  console.log('pdf-parse not installed — skipping PDF extraction. Install pdf-parse to enable it.');
+  console.log('pdf-parse not installed — PDF extraction will be skipped unless you `npm i pdf-parse`.');
 }
 
-// Helper: sanitize a chunk of text
+// ------------------ multer: preserve original extension ------------------
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => {
+    // use timestamp + original extension to preserve .pdf/.docx/.doc etc
+    const ext = path.extname(file.originalname) || '';
+    cb(null, `${Date.now()}${ext}`);
+  }
+});
+const upload = multer({ storage });
+
+// ------------------ helpers ------------------
 function cleanText(t) {
   if (!t) return '';
   return sanitizeHtml(t, { allowedTags: [], allowedAttributes: {} }).replace(/\r/g, '').trim();
 }
 
-// Upload endpoint (returns localPath)
-app.post('/upload-cv', upload.single('cv'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
-    const localPath = path.resolve(req.file.path);
-    return res.json({ ok: true, filename: req.file.filename, originalname: req.file.originalname, localPath });
-  } catch (err) {
-    console.error('upload error:', err);
-    return res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-/*
-  Fetch DeepSeek share page and extract meaningful text (best effort).
-  Removes script/style/iframe to reduce noise and filters JS-like lines.
-*/
 async function fetchDeepseekText(url) {
   try {
     const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 20000 });
-    if (!resp.ok) throw new Error('DeepSeek page not accessible, status: ' + resp.status);
+    if (!resp.ok) throw new Error('DeepSeek page not accessible: ' + resp.status);
     const html = await resp.text();
     const $ = cheerio.load(html);
 
-    // remove noise nodes
     $('script, style, noscript, iframe').remove();
     $('*').each((i, el) => {
       const attribs = el.attribs || {};
@@ -100,25 +101,43 @@ async function fetchDeepseekText(url) {
 
     return collected;
   } catch (err) {
-    console.error('fetchDeepseekText error:', err.message || err);
+    console.error('fetchDeepseekText error:', err && err.message);
     return '';
   }
 }
 
-/* DOCX extraction using mammoth - recommended for Word docs */
+// Try to extract docx using mammoth (pass Buffer)
 async function extractTextFromDocx(localPath) {
   try {
-    const buffer = fs.readFileSync(localPath);
+    const buffer = fs.readFileSync(localPath); // buffer, not utf8 string
     const result = await mammoth.extractRawText({ buffer });
     const text = (result && result.value) ? result.value : '';
     return cleanText(text);
   } catch (err) {
-    console.warn('mammoth extraction failed:', err.message || err);
+    console.warn('mammoth extraction failed:', err && err.message);
     return '';
   }
 }
 
-/* Optional PDF extraction if pdf-parse present */
+// adm-zip fallback for DOCX: read word/document.xml and strip tags
+function extractTextFromDocxZipFallback(localPath) {
+  try {
+    const zip = new AdmZip(localPath);
+    const entry = zip.getEntry('word/document.xml');
+    if (!entry) {
+      console.warn('zip fallback: word/document.xml not found');
+      return '';
+    }
+    const xml = entry.getData().toString('utf8');
+    const text = xml.replace(/<[^>]+>/g, ' ').replace(/\s{2,}/g, ' ').trim();
+    return cleanText(text);
+  } catch (err) {
+    console.warn('zip fallback failed:', err && err.message);
+    return '';
+  }
+}
+
+// PDF extraction (optional)
 async function extractTextFromPdf(localPath) {
   if (!pdfParse) return '';
   try {
@@ -126,17 +145,34 @@ async function extractTextFromPdf(localPath) {
     const data = await pdfParse(buffer);
     return (data && data.text) ? cleanText(data.text) : '';
   } catch (err) {
-    console.warn('PDF extraction failed:', err.message || err);
+    console.warn('pdf-parse extraction failed:', err && err.message);
     return '';
   }
 }
 
-/* Heuristic parser: split text into CV-like sections */
+// ------------------ upload endpoint ------------------
+app.post('/upload-cv', upload.single('cv'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
+    // send back the exact full path on server (with extension preserved)
+    const localPath = path.resolve(req.file.path);
+    return res.json({
+      ok: true,
+      filename: req.file.filename,
+      originalname: req.file.originalname,
+      localPath
+    });
+  } catch (err) {
+    console.error('upload error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ------------------ CV parsing & HTML generation ------------------
 function parseCvSections(text) {
   const trimmed = (text || '').replace(/\r/g, '').trim();
   const lines = trimmed.split('\n').map(l => l.trim()).filter(Boolean);
 
-  // choose a name candidate by first meaningful short-ish line
   let name = 'Candidate Name';
   for (let i = 0; i < Math.min(6, lines.length); i++) {
     const l = lines[i];
@@ -147,7 +183,6 @@ function parseCvSections(text) {
   const nameIndex = lines.findIndex(l => l === name);
   const summary = lines.slice(nameIndex + 1, nameIndex + 6).join(' ') || '';
 
-  // simple extractor by headings/key words
   const lower = lines.map(l => l.toLowerCase());
   function extract(headers) {
     const idx = lower.findIndex(l => headers.some(h => l.startsWith(h) || l.includes(h)));
@@ -171,13 +206,11 @@ function parseCvSections(text) {
     contact: extract(['contact', 'email', 'phone', 'linkedin'])
   };
 
-  // fallback assignments
   if (!sections.experience && lines.length > 6) sections.experience = lines.slice(6, Math.min(lines.length, 60)).join('\n');
   if (!sections.summary && lines.length > 1) sections.summary = lines.slice(1, 6).join(' ');
   return sections;
 }
 
-/* Generate final standalone HTML using theme params */
 function generateFullHtml(sections, themeType = 'modern', themeColors = 'black', professional = true) {
   const esc = s => sanitizeHtml(String(s || ''), { allowedTags: [], allowedAttributes: {} }).replace(/\n/g, '<br>');
   const primary = (themeColors || '').split(/\s+/)[0] || '#111111';
@@ -190,27 +223,25 @@ function generateFullHtml(sections, themeType = 'modern', themeColors = 'black',
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>${esc(sections.name)} — CV Website</title>
 <style>
-  :root{--primary:${primary};--accent:${accent};--bg:#ffffff;--text:#222}
-  body{font-family:Inter, Arial, sans-serif;background:#f6f8fb;margin:0;padding:24px;color:var(--text)}
-  .wrap{max-width:980px;margin:36px auto;background:var(--bg);border-radius:12px;padding:28px;box-shadow:0 10px 30px rgba(20,20,40,.06)}
-  header{display:flex;gap:18px;align-items:center;border-bottom:1px solid #eee;padding-bottom:18px;margin-bottom:20px}
-  .avatar{width:96px;height:96px;border-radius:14px;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:28px}
-  h1{margin:0;font-size:28px}
-  .meta{color:#666;margin-top:6px}
-  .section{margin-bottom:20px}
-  .section h2{margin:0 0 8px 0;color:var(--primary);font-size:18px}
-  .card{background:#fbfbff;padding:12px;border-radius:10px;border:1px solid #f0f0ff}
-  .skill-chip{display:inline-block;padding:6px 10px;margin:6px 6px 0 0;border-radius:999px;background:#f2f3ff;font-size:13px}
-  pre{white-space:pre-wrap;font-family:inherit}
-  footer{border-top:1px solid #eee;padding-top:12px;color:#777;font-size:13px;margin-top:28px}
-  .pulse{animation:pulse 2.2s infinite}
-  @keyframes pulse{0%{transform:translateY(0)}50%{transform:translateY(-2px)}100%{transform:translateY(0)}}
+:root{--primary:${primary};--accent:${accent};--bg:#ffffff;--text:#222}
+body{font-family:Inter, Arial, sans-serif;background:#f6f8fb;margin:0;padding:24px;color:var(--text)}
+.wrap{max-width:980px;margin:36px auto;background:var(--bg);border-radius:12px;padding:28px;box-shadow:0 10px 30px rgba(20,20,40,.06)}
+header{display:flex;gap:18px;align-items:center;border-bottom:1px solid #eee;padding-bottom:18px;margin-bottom:20px}
+.avatar{width:96px;height:96px;border-radius:14px;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:28px}
+h1{margin:0;font-size:28px}
+.meta{color:#666;margin-top:6px}
+.section{margin-bottom:20px}
+.section h2{margin:0 0 8px 0;color:var(--primary);font-size:18px}
+.card{background:#fbfbff;padding:12px;border-radius:10px;border:1px solid #f0f0ff}
+.skill-chip{display:inline-block;padding:6px 10px;margin:6px 6px 0 0;border-radius:999px;background:#f2f3ff;font-size:13px}
+pre{white-space:pre-wrap;font-family:inherit}
+footer{border-top:1px solid #eee;padding-top:12px;color:#777;font-size:13px;margin-top:28px}
 </style>
 </head>
 <body>
   <div class="wrap">
     <header>
-      <div class="avatar pulse">${(sections.name && sections.name[0]) || 'A'}</div>
+      <div class="avatar">${(sections.name && sections.name[0]) || 'A'}</div>
       <div>
         <h1>${esc(sections.name)}</h1>
         <div class="meta">${esc(sections.summary)}</div>
@@ -248,7 +279,7 @@ function generateFullHtml(sections, themeType = 'modern', themeColors = 'black',
 </html>`;
 }
 
-// /generate endpoint - prioritizes DeepSeek, then DOCX (mammoth), then PDF (pdf-parse)
+// ------------------ /generate endpoint ------------------
 app.post('/generate', async (req, res) => {
   try {
     const {
@@ -263,23 +294,41 @@ app.post('/generate', async (req, res) => {
 
     let cvText = '';
 
-    // 1) Try DeepSeek link if provided
+    // 1) DeepSeek first
     if (deepseekUrl) {
       cvText = await fetchDeepseekText(deepseekUrl);
       console.log('DeepSeek extracted length:', cvText.length);
     }
 
-    // 2) If not enough text, try DOCX using mammoth (preferred for Word)
+    // 2) If not enough text, attempt DOCX extraction (mammoth) if file present
     if ((!cvText || cvText.length < 120) && uploadedFilePath && fs.existsSync(uploadedFilePath)) {
       const ext = path.extname(uploadedFilePath).toLowerCase();
-      if (ext === '.docx' || ext === '.doc') {
-        console.log('Attempting DOCX extraction from', uploadedFilePath);
+      if (ext === '.docx') {
+        console.log('Attempting DOCX extraction (mammoth) from', uploadedFilePath);
         const docxText = await extractTextFromDocx(uploadedFilePath);
-        if (docxText && docxText.length > cvText.length) cvText = docxText;
+        if ((!cvText || docxText.length > cvText.length) && docxText && docxText.length > 20) cvText = docxText;
+
+        if ((!cvText || cvText.length < 80)) {
+          console.log('Mammoth returned little text; trying zip fallback...');
+          const fallback = extractTextFromDocxZipFallback(uploadedFilePath);
+          if (fallback && fallback.length > cvText.length) cvText = fallback;
+        }
+      } else if (ext === '.doc') {
+        // .doc is the older binary Word format. Mammoth does not parse it reliably.
+        // Best practice: convert .doc -> .docx (LibreOffice) on the server, then run mammoth.
+        // You can optionally enable automatic conversion with LibreOffice CLI if available:
+        //
+        // Example (optional):
+        // const { execSync } = require('child_process');
+        // const converted = uploadedFilePath + '.converted.docx';
+        // execSync(`soffice --headless --convert-to docx --outdir ${path.dirname(uploadedFilePath)} ${uploadedFilePath}`);
+        // then set uploadedFilePath = path.join(path.dirname(uploadedFilePath), '<converted-filename>.docx')
+        //
+        console.log('.doc uploaded: convert to .docx (LibreOffice) for best results or ask user to upload .docx.');
       }
     }
 
-    // 3) If still short, try PDF extraction (if available) or reading raw text as fallback
+    // 3) PDF fallback (pdf-parse) or try reading raw text
     if ((!cvText || cvText.length < 120) && uploadedFilePath && fs.existsSync(uploadedFilePath)) {
       const ext = path.extname(uploadedFilePath).toLowerCase();
       if (ext === '.pdf' && pdfParse) {
@@ -287,24 +336,28 @@ app.post('/generate', async (req, res) => {
         const pdfText = await extractTextFromPdf(uploadedFilePath);
         if (pdfText && pdfText.length > cvText.length) cvText = pdfText;
       } else {
+        // try reading plain text (for plain text or server-saved HTML)
         try {
           const raw = fs.readFileSync(uploadedFilePath, 'utf8');
           if (raw && raw.length > cvText.length) cvText = cleanText(raw);
         } catch (e) {
-          // binary/unreadable; skip
+          // unreadable as utf8 (likely binary) - nothing to do
         }
       }
     }
 
     if (!cvText || cvText.trim().length < 80) {
-      return res.status(400).json({ ok: false, error: 'Could not extract CV text from DeepSeek, uploaded DOCX, or uploaded file. Ensure DeepSeek share is public or upload a readable DOCX/PDF.' });
+      return res.status(400).json({
+        ok: false,
+        error: 'Could not extract CV text from DeepSeek, uploaded DOCX, or uploaded file. Ensure DeepSeek share is public or upload a readable DOCX/PDF.'
+      });
     }
 
     const sections = parseCvSections(cvText);
     const html = generateFullHtml(sections, themeType, themeColors, professional);
     return res.json({ ok: true, html });
   } catch (err) {
-    console.error('generate error:', err);
+    console.error('generate error:', err && (err.stack || err.message || err));
     return res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
