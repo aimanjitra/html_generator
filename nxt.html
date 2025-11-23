@@ -610,7 +610,7 @@
       try {
         const fd = new FormData();
         fd.append('cv', cvInput.files[0]);
-        const res = await fetch('http://localhost:3000/upload-cv', { method: 'POST', body: fd });
+        const res = await fetch('https://html-generator-oos8.onrender.com', { method: 'POST', body: fd });
         const json = await res.json();
         
         clearInterval(progressInterval);
