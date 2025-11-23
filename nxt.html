@@ -5,7 +5,7 @@
   <title>CV → HTML Generator (ChatGPT / DeepSeek)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    :root{--primary:#6c5ce7;--secondary:#a29bfe;--accent:#fd79a8;--dark:#2d3436}
+    :root{--primary:#6c5ce7;--accent:#fd79a8;--dark:#2d3436}
     *{box-sizing:border-box;margin:0;padding:0}
     body{font-family:Segoe UI,Arial,sans-serif;padding:20px;background:#f5f7fa;color:var(--dark)}
     .container{max-width:1100px;margin:0 auto}
@@ -14,11 +14,7 @@
     textarea{width:100%;height:420px;border-radius:8px;border:1px solid #e6e6e6;padding:12px;font-family:monospace}
     .progress-bar{height:8px;background:#eee;border-radius:6px;overflow:hidden;margin-top:12px}
     .progress-fill{height:100%;width:0%;background:linear-gradient(90deg,var(--primary),var(--accent));transition:width .4s}
-    .status{padding:10px;border-radius:8px;margin-top:12px}
-    .success{background:#e8f7ef;color:#008a4b}
-    .error{background:#fdecea;color:#b02a22}
-    .note{font-size:0.9rem;color:#666;margin-top:8px}
-    label{display:block}
+    label{display:block;margin-top:8px}
     input[type="text"], input[type="file"]{width:100%;padding:8px;border-radius:6px;border:1px solid #ddd;margin-top:6px}
     .small{font-size:0.9rem;color:#666}
   </style>
@@ -27,7 +23,7 @@
   <div class="container">
     <div class="card">
       <h2>Upload CV (optional)</h2>
-      <p class="note">You can upload a CV (PDF/DOCX). If you already uploaded one earlier, the backend will use the existing local file path.</p>
+      <p class="small">Upload PDF/DOCX. If you already uploaded earlier on server, it will use the default local path.</p>
 
       <div>
         <input id="cv" type="file" />
@@ -39,159 +35,127 @@
 
     <div class="card">
       <h2>Generate Full Website HTML</h2>
-      <p class="note">This will call your backend which will use the DeepSeek link (or uploaded CV) to produce a full HTML website you can copy/paste.</p>
+      <p class="small">Provide DeepSeek share link (optional) and your theme preferences.</p>
 
-      <div style="display:grid;gap:10px">
-        <label>
-          DeepSeek link (optional)
-          <input id="deepseekUrl" type="text" placeholder="https://chat.deepseek.com/a/chat/s/..." />
-          <div class="small">Put your DeepSeek share link here; if you leave empty the backend will try uploaded CV.</div>
-        </label>
+      <label>
+        DeepSeek link (optional)
+        <input id="deepseekUrl" type="text" placeholder="https://chat.deepseek.com/a/chat/s/..." />
+      </label>
 
-        <label>
-          Theme type (free text)
-          <input id="themeType" type="text" placeholder="e.g. modern / cyber / photo" />
-        </label>
+      <label>
+        Theme type
+        <input id="themeType" type="text" placeholder="e.g. modern / cyber / photo" />
+      </label>
 
-        <label>
-          Colors (free text)
-          <input id="themeColors" type="text" placeholder="e.g. black white / #ff0000 #fff" />
-        </label>
+      <label>
+        Colors
+        <input id="themeColors" type="text" placeholder="e.g. black yellow / #000 #ff0" />
+      </label>
 
-        <label style="display:flex;align-items:center;gap:8px;margin-top:6px">
-          <input id="professional" type="checkbox" checked /> <span class="small">Professional layout</span>
-        </label>
+      <label style="margin-top:8px">
+        <input id="professional" type="checkbox" checked /> Professional layout
+      </label>
 
-        <button id="generate" class="button">✨ Generate Full HTML</button>
-        <div id="resultStatus"></div>
-      </div>
+      <button id="generate" class="button" style="margin-top:12px">✨ Generate Full HTML</button>
+      <div id="resultStatus"></div>
     </div>
 
     <div class="card">
       <h2>Generated HTML (full page)</h2>
-      <p class="small">Copy the full HTML produced by the backend (complete & standalone).</p>
       <textarea id="out" placeholder="Generated full HTML will appear here..."></textarea>
     </div>
   </div>
 
-  <script>
-    // CONFIG: set your backend base URL (Render URL) here
-    const BACKEND_BASE = 'https://html-generator-oos8.onrender.com'; // <-- change to your Render URL if different
+<script>
+  // CHANGE THIS to your backend URL (Render service URL) if different:
+  const BACKEND_BASE = 'https://html-generator-oos8.onrender.com';
 
-    // Developer-provided default local file path (from your environment). We'll send this if user doesn't upload.
-    // <--- DO NOT change unless you uploaded a different file path on server -->
-    const DEFAULT_UPLOADED_FILE_PATH = '/mnt/data/f124d69d-5701-4fec-9c21-e5db7eecd1cc.png';
+  const cvInput = document.getElementById('cv');
+  const uploadBtn = document.getElementById('uploadBtn');
+  const uploadProgress = document.getElementById('uploadProgress');
+  const uploadResult = document.getElementById('uploadResult');
 
-    // DOM refs
-    const cvInput = document.getElementById('cv');
-    const uploadBtn = document.getElementById('uploadBtn');
-    const uploadProgress = document.getElementById('uploadProgress');
-    const uploadResult = document.getElementById('uploadResult');
+  const deepseekUrlInput = document.getElementById('deepseekUrl');
+  const themeTypeInput = document.getElementById('themeType');
+  const themeColorsInput = document.getElementById('themeColors');
+  const professionalCheckbox = document.getElementById('professional');
+  const generateBtn = document.getElementById('generate');
+  const outTextarea = document.getElementById('out');
+  const resultStatus = document.getElementById('resultStatus');
 
-    const deepseekUrlInput = document.getElementById('deepseekUrl');
-    const themeTypeInput = document.getElementById('themeType');
-    const themeColorsInput = document.getElementById('themeColors');
-    const professionalCheckbox = document.getElementById('professional');
-    const generateBtn = document.getElementById('generate');
-    const outTextarea = document.getElementById('out');
-    const resultStatus = document.getElementById('resultStatus');
+  // <-- default server-side file path (set to the uploaded CV path you provided) -->
+  let uploadedFileUrl = '/mnt/data/CV Aiman.pdf';
 
-    // This value will be set to the file path returned by /upload-cv or left as default
-    let uploadedFileUrl = DEFAULT_UPLOADED_FILE_PATH;
-
-    // Upload CV -> POST /upload-cv
-    uploadBtn.addEventListener('click', async () => {
-      if (!cvInput.files.length) {
-        uploadResult.innerHTML = '<div class="status error">Please choose a CV first</div>';
-        return;
-      }
-      const fd = new FormData();
-      fd.append('cv', cvInput.files[0]);
-
-      uploadProgress.style.width = '0%';
-      let progress = 0;
-      const timer = setInterval(() => {
-        progress = Math.min(90, progress + 8);
-        uploadProgress.style.width = progress + '%';
-      }, 150);
-
-      try {
-        const res = await fetch(BACKEND_BASE + '/upload-cv', { method: 'POST', body: fd });
-        const j = await res.json();
-        clearInterval(timer);
-        uploadProgress.style.width = '100%';
-
-        if (j && (j.ok || j.success)) {
-          // prefer a returned public URL/localPath if present
-          if (j.localPath) uploadedFileUrl = j.localPath;
-          if (j.url) uploadedFileUrl = j.url;
-          uploadResult.innerHTML = '<div class="status success">Upload successful</div>';
-        } else {
-          uploadResult.innerHTML = '<div class="status error">Upload failed</div>';
-        }
-      } catch (err) {
-        clearInterval(timer);
-        uploadProgress.style.width = '0%';
-        uploadResult.innerHTML = '<div class="status error">Upload error: ' + err.message + '</div>';
-      }
-    });
-
-    // Generate full HTML -> POST /generate (includes deepseekUrl)
-    generateBtn.addEventListener('click', async () => {
-      const deepseekUrl = (deepseekUrlInput.value || '').trim();
-      const themeType = (themeTypeInput.value || 'modern').trim();
-      const themeColors = (themeColorsInput.value || '').trim();
-      const professional = professionalCheckbox.checked;
-
-      // optional: warn user if they didn't provide any source
-if (!deepseekUrl && (!uploadedFileUrl || uploadedFileUrl === DEFAULT_UPLOADED_FILE_PATH)) {
-  // no deepseek link and only the default file path is set -> user likely did not provide a usable file
-  // you can show a message if you want:
-  // resultStatus.innerHTML = '<div class="status error">Please upload your CV or paste a DeepSeek link.</div>';
-}
-
-      setGenerating(true, 'Requesting long-form HTML — this may take a minute.');
-
-      try {
-        const payload = {
-          deepseekUrl,             // DeepSeek share link from user
-          themeType,
-          themeColors,
-          professional,
-          uploadedFilePath: uploadedFileUrl
-        };
-
-        const res = await fetch(BACKEND_BASE + '/generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-
-        const j = await res.json();
-        if (!j || !j.ok) throw new Error((j && j.error) ? j.error : 'No response from server');
-
-        outTextarea.value = j.html || '';
-        resultStatus.innerHTML = '<div class="status success">Full HTML received — copy from the box above.</div>';
-      } catch (err) {
-        resultStatus.innerHTML = '<div class="status error">Error: ' + err.message + '</div>';
-      } finally {
-        setGenerating(false);
-      }
-    });
-
-    function setGenerating(on, msg='') {
-      if (on) {
-        generateBtn.disabled = true;
-        generateBtn.textContent = '⏳ Generating…';
-        resultStatus.innerHTML = msg ? '<div class="status">' + msg + '</div>' : '';
-      } else {
-        generateBtn.disabled = false;
-        generateBtn.textContent = '✨ Generate Full HTML';
-      }
+  uploadBtn.addEventListener('click', async () => {
+    if (!cvInput.files.length) {
+      uploadResult.innerHTML = '<div class="small" style="color:#b02a22">Please choose a CV first</div>';
+      return;
     }
+    const fd = new FormData();
+    fd.append('cv', cvInput.files[0]);
 
-    // init
     uploadProgress.style.width = '0%';
-  </script>
+    let progress = 0;
+    const timer = setInterval(() => { progress = Math.min(90, progress + 8); uploadProgress.style.width = progress + '%'; }, 150);
+
+    try {
+      const res = await fetch(BACKEND_BASE + '/upload-cv', { method: 'POST', body: fd });
+      const j = await res.json();
+      clearInterval(timer);
+      uploadProgress.style.width = '100%';
+      if (j && (j.ok || j.success)) {
+        if (j.localPath) uploadedFileUrl = j.localPath;
+        if (j.url) uploadedFileUrl = j.url;
+        uploadResult.innerHTML = '<div class="small" style="color:#008a4b">Upload successful</div>';
+      } else {
+        uploadResult.innerHTML = '<div class="small" style="color:#b02a22">Upload failed</div>';
+      }
+    } catch (err) {
+      clearInterval(timer);
+      uploadProgress.style.width = '0%';
+      uploadResult.innerHTML = '<div class="small" style="color:#b02a22">Upload error: ' + err.message + '</div>';
+    }
+  });
+
+  generateBtn.addEventListener('click', async () => {
+    const deepseekUrl = (deepseekUrlInput.value || '').trim();
+    const themeType = (themeTypeInput.value || 'modern').trim();
+    const themeColors = (themeColorsInput.value || '').trim();
+    const professional = professionalCheckbox.checked;
+
+    setGenerating(true, 'Requesting long-form HTML — this may take a minute.');
+
+    try {
+      const payload = { deepseekUrl, themeType, themeColors, professional, uploadedFilePath: uploadedFileUrl };
+      const res = await fetch(BACKEND_BASE + '/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const j = await res.json();
+      if (!j || !j.ok) throw new Error((j && j.error) ? j.error : 'No response from server');
+      outTextarea.value = j.html || '';
+      resultStatus.innerHTML = '<div class="small" style="color:#008a4b">Full HTML received — copy from the box above.</div>';
+    } catch (err) {
+      resultStatus.innerHTML = '<div class="small" style="color:#b02a22">Error: ' + err.message + '</div>';
+    } finally {
+      setGenerating(false);
+    }
+  });
+
+  function setGenerating(on, msg='') {
+    if (on) {
+      generateBtn.disabled = true;
+      generateBtn.textContent = '⏳ Generating…';
+      resultStatus.innerHTML = msg ? '<div class="small">' + msg + '</div>' : '';
+    } else {
+      generateBtn.disabled = false;
+      generateBtn.textContent = '✨ Generate Full HTML';
+    }
+  }
+
+  // init
+  uploadProgress.style.width = '0%';
+</script>
 </body>
 </html>
