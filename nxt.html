@@ -2,10 +2,9 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>CV → HTML Generator (ChatGPT)</title>
+  <title>CV → HTML Generator (ChatGPT / DeepSeek)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    /* trimmed styles (same look as before) */
     :root{--primary:#6c5ce7;--secondary:#a29bfe;--accent:#fd79a8;--dark:#2d3436}
     *{box-sizing:border-box;margin:0;padding:0}
     body{font-family:Segoe UI,Arial,sans-serif;padding:20px;background:#f5f7fa;color:var(--dark)}
@@ -19,6 +18,9 @@
     .success{background:#e8f7ef;color:#008a4b}
     .error{background:#fdecea;color:#b02a22}
     .note{font-size:0.9rem;color:#666;margin-top:8px}
+    label{display:block}
+    input[type="text"], input[type="file"]{width:100%;padding:8px;border-radius:6px;border:1px solid #ddd;margin-top:6px}
+    .small{font-size:0.9rem;color:#666}
   </style>
 </head>
 <body>
@@ -36,47 +38,57 @@
     </div>
 
     <div class="card">
-      <h2>Generate Full Website HTML (ChatGPT)</h2>
-      <p class="note">This will call your backend which uses the OpenAI API to generate a complete HTML document. The result appears below for copy/paste.</p>
+      <h2>Generate Full Website HTML</h2>
+      <p class="note">This will call your backend which will use the DeepSeek link (or uploaded CV) to produce a full HTML website you can copy/paste.</p>
 
       <div style="display:grid;gap:10px">
         <label>
+          DeepSeek link (optional)
+          <input id="deepseekUrl" type="text" placeholder="https://chat.deepseek.com/a/chat/s/..." />
+          <div class="small">Put your DeepSeek share link here; if you leave empty the backend will try uploaded CV.</div>
+        </label>
+
+        <label>
           Theme type (free text)
-          <input id="themeType" type="text" placeholder="e.g. modern / cyber / photo" style="width:100%;padding:8px;border-radius:6px;border:1px solid #ddd" />
+          <input id="themeType" type="text" placeholder="e.g. modern / cyber / photo" />
         </label>
 
         <label>
           Colors (free text)
-          <input id="themeColors" type="text" placeholder="e.g. black white / #ff0000 #fff" style="width:100%;padding:8px;border-radius:6px;border:1px solid #ddd" />
+          <input id="themeColors" type="text" placeholder="e.g. black white / #ff0000 #fff" />
         </label>
 
-        <label style="display:flex;align-items:center;gap:8px">
-          <input id="professional" type="checkbox" checked /> Professional layout
+        <label style="display:flex;align-items:center;gap:8px;margin-top:6px">
+          <input id="professional" type="checkbox" checked /> <span class="small">Professional layout</span>
         </label>
 
-        <button id="generate" class="button">✨ Generate Full HTML (ChatGPT)</button>
+        <button id="generate" class="button">✨ Generate Full HTML</button>
         <div id="resultStatus"></div>
       </div>
     </div>
 
     <div class="card">
       <h2>Generated HTML (full page)</h2>
+      <p class="small">Copy the full HTML produced by the backend (complete & standalone).</p>
       <textarea id="out" placeholder="Generated full HTML will appear here..."></textarea>
     </div>
   </div>
 
   <script>
-    // <-- CONFIG: set your backend base URL (Render URL) here -->
-    const BACKEND_BASE = 'https://html-generator-oos8.onrender.com'; // change if different
+    // CONFIG: set your backend base URL (Render URL) here
+    const BACKEND_BASE = 'https://html-generator-oos8.onrender.com'; // <-- change to your Render URL if different
 
-    // Use the exact local path you uploaded earlier (developer note)
+    // Developer-provided default local file path (from your environment). We'll send this if user doesn't upload.
+    // <--- DO NOT change unless you uploaded a different file path on server -->
     const DEFAULT_UPLOADED_FILE_PATH = '/mnt/data/f124d69d-5701-4fec-9c21-e5db7eecd1cc.png';
 
+    // DOM refs
     const cvInput = document.getElementById('cv');
     const uploadBtn = document.getElementById('uploadBtn');
     const uploadProgress = document.getElementById('uploadProgress');
     const uploadResult = document.getElementById('uploadResult');
 
+    const deepseekUrlInput = document.getElementById('deepseekUrl');
     const themeTypeInput = document.getElementById('themeType');
     const themeColorsInput = document.getElementById('themeColors');
     const professionalCheckbox = document.getElementById('professional');
@@ -124,17 +136,23 @@
       }
     });
 
-    // Generate full HTML -> POST /generate
+    // Generate full HTML -> POST /generate (includes deepseekUrl)
     generateBtn.addEventListener('click', async () => {
+      const deepseekUrl = (deepseekUrlInput.value || '').trim();
       const themeType = (themeTypeInput.value || 'modern').trim();
       const themeColors = (themeColorsInput.value || '').trim();
       const professional = professionalCheckbox.checked;
 
-      setGenerating(true, 'Requesting long-form HTML from ChatGPT — this may take a minute.');
+      // Optional: require at least one source
+      if (!deepseekUrl && (!uploadedFileUrl || uploadedFileUrl === DEFAULT_UPLOADED_FILE_PATH === false)) {
+        // not required, but helpful reminder
+      }
+
+      setGenerating(true, 'Requesting long-form HTML — this may take a minute.');
 
       try {
-        // payload sends uploadedFileUrl (local path or url) to backend
         const payload = {
+          deepseekUrl,             // DeepSeek share link from user
           themeType,
           themeColors,
           professional,
@@ -148,7 +166,7 @@
         });
 
         const j = await res.json();
-        if (!j || !j.ok) throw new Error((j && j.error) ? j.error : 'No response');
+        if (!j || !j.ok) throw new Error((j && j.error) ? j.error : 'No response from server');
 
         outTextarea.value = j.html || '';
         resultStatus.innerHTML = '<div class="status success">Full HTML received — copy from the box above.</div>';
@@ -163,10 +181,10 @@
       if (on) {
         generateBtn.disabled = true;
         generateBtn.textContent = '⏳ Generating…';
-        resultStatus.innerHTML = msg ? '<div class="status"> ' + msg + '</div>' : '';
+        resultStatus.innerHTML = msg ? '<div class="status">' + msg + '</div>' : '';
       } else {
         generateBtn.disabled = false;
-        generateBtn.textContent = '✨ Generate Full HTML (ChatGPT)';
+        generateBtn.textContent = '✨ Generate Full HTML';
       }
     }
 
