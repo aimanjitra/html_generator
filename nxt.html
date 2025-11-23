@@ -143,10 +143,12 @@
       const themeColors = (themeColorsInput.value || '').trim();
       const professional = professionalCheckbox.checked;
 
-      // Optional: require at least one source
-      if (!deepseekUrl && (!uploadedFileUrl || uploadedFileUrl === DEFAULT_UPLOADED_FILE_PATH === false)) {
-        // not required, but helpful reminder
-      }
+      // optional: warn user if they didn't provide any source
+if (!deepseekUrl && (!uploadedFileUrl || uploadedFileUrl === DEFAULT_UPLOADED_FILE_PATH)) {
+  // no deepseek link and only the default file path is set -> user likely did not provide a usable file
+  // you can show a message if you want:
+  // resultStatus.innerHTML = '<div class="status error">Please upload your CV or paste a DeepSeek link.</div>';
+}
 
       setGenerating(true, 'Requesting long-form HTML — this may take a minute.');
 
