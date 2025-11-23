@@ -1,6 +1,6 @@
 // server.js
-// DeepSeek-share-link based CV -> Full HTML generator
-// Tries DeepSeek first; falls back to PDF extraction (pdf-parse) if available.
+// DeepSeek + uploaded DOCX/PDF -> Full HTML generator
+// Uses: express, multer, cheerio, mammoth, optional pdf-parse, sanitize-html
 
 const express = require('express');
 const multer = require('multer');
@@ -10,44 +10,49 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 const cheerio = require('cheerio');
 const sanitizeHtml = require('sanitize-html');
+const mammoth = require('mammoth');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Multer upload folder
 const upload = multer({ dest: 'uploads/' });
 
-// <-- IMPORTANT: default local file path you uploaded earlier -->
+// Default fallback file path you used on server (change if needed)
 const DEFAULT_UPLOADED_FILE_PATH = '/mnt/data/CV Aiman.pdf';
 
 // Try to require pdf-parse optionally
 let pdfParse;
 try {
   pdfParse = require('pdf-parse');
-  console.log('pdf-parse available: will attempt PDF extraction.');
+  console.log('pdf-parse available: will attempt PDF extraction if needed.');
 } catch (e) {
-  console.log('pdf-parse not installed or failed to load — PDF extraction will be skipped.');
+  console.log('pdf-parse not installed — skipping PDF extraction. Install pdf-parse to enable it.');
 }
 
-// helper: sanitize text
+// Helper: sanitize a chunk of text
 function cleanText(t) {
   if (!t) return '';
   return sanitizeHtml(t, { allowedTags: [], allowedAttributes: {} }).replace(/\r/g, '').trim();
 }
 
-// Upload endpoint
+// Upload endpoint (returns localPath)
 app.post('/upload-cv', upload.single('cv'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
     const localPath = path.resolve(req.file.path);
     return res.json({ ok: true, filename: req.file.filename, originalname: req.file.originalname, localPath });
   } catch (err) {
-    console.error(err);
+    console.error('upload error:', err);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// Fetch and extract text from DeepSeek share page (best-effort)
+/*
+  Fetch DeepSeek share page and extract meaningful text (best effort).
+  Removes script/style/iframe to reduce noise and filters JS-like lines.
+*/
 async function fetchDeepseekText(url) {
   try {
     const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 20000 });
@@ -55,13 +60,11 @@ async function fetchDeepseekText(url) {
     const html = await resp.text();
     const $ = cheerio.load(html);
 
-    // remove script/style/noscript/iframe nodes to reduce noise
+    // remove noise nodes
     $('script, style, noscript, iframe').remove();
     $('*').each((i, el) => {
       const attribs = el.attribs || {};
-      for (const a of Object.keys(attribs)) {
-        if (/on\w+/i.test(a)) $(el).removeAttr(a);
-      }
+      for (const a of Object.keys(attribs)) if (/on\w+/i.test(a)) $(el).removeAttr(a);
     });
 
     const selectors = ['article', '.chat', '.message', '.prose', '#root', 'main', '.chat-message', '.message-content'];
@@ -78,7 +81,6 @@ async function fetchDeepseekText(url) {
       if (collected.length > 400) break;
     }
 
-    // fallback: body text filtered
     if (!collected || collected.length < 200) {
       const bodyText = cleanText($('body').text()).replace(/\s{2,}/g, '\n').trim();
       const noise = ['Share', 'Copied', 'OpenAI', 'Sign in', 'Sign up', 'DeepSeek', 'Home', 'About', 'cookie', 'cdn-cgi', '__CF$'];
@@ -90,10 +92,9 @@ async function fetchDeepseekText(url) {
       }).join('\n');
     }
 
-    // filter JS-like remaining lines
     collected = collected.split('\n').filter(l => {
       if (/function\s*\(|document\.|cdn-cgi|__CF\$|eval\(/i.test(l)) return false;
-      if (l.length > 200 && !/\s/.test(l)) return false; // long base64-ish lines
+      if (l.length > 200 && !/\s/.test(l)) return false;
       return l.trim().length > 0;
     }).join('\n').replace(/\n{3,}/g, '\n\n').trim();
 
@@ -104,31 +105,52 @@ async function fetchDeepseekText(url) {
   }
 }
 
-// Optional: extract text with pdf-parse if available
+/* DOCX extraction using mammoth - recommended for Word docs */
+async function extractTextFromDocx(localPath) {
+  try {
+    const buffer = fs.readFileSync(localPath);
+    const result = await mammoth.extractRawText({ buffer });
+    const text = (result && result.value) ? result.value : '';
+    return cleanText(text);
+  } catch (err) {
+    console.warn('mammoth extraction failed:', err.message || err);
+    return '';
+  }
+}
+
+/* Optional PDF extraction if pdf-parse present */
 async function extractTextFromPdf(localPath) {
   if (!pdfParse) return '';
   try {
     const buffer = fs.readFileSync(localPath);
     const data = await pdfParse(buffer);
-    return (data && data.text) ? data.text : '';
+    return (data && data.text) ? cleanText(data.text) : '';
   } catch (err) {
     console.warn('PDF extraction failed:', err.message || err);
     return '';
   }
 }
 
-// Heuristic: parse CV-like sections from text
+/* Heuristic parser: split text into CV-like sections */
 function parseCvSections(text) {
-  const lines = (text || '').split('\n').map(l => l.trim()).filter(Boolean);
-  const sections = {
-    raw: text,
-    name: lines[0] || 'Candidate Name',
-    summary: lines.slice(1, 6).join(' ')
-  };
+  const trimmed = (text || '').replace(/\r/g, '').trim();
+  const lines = trimmed.split('\n').map(l => l.trim()).filter(Boolean);
 
-  function extract(headerKeywords) {
-    const lower = lines.map(l => l.toLowerCase());
-    const idx = lower.findIndex(l => headerKeywords.some(h => l.startsWith(h) || l.includes(h)));
+  // choose a name candidate by first meaningful short-ish line
+  let name = 'Candidate Name';
+  for (let i = 0; i < Math.min(6, lines.length); i++) {
+    const l = lines[i];
+    if (/function\s*\(|document\.|cdn-cgi|__CF\$|https?:\/\//i.test(l)) continue;
+    if (l.length > 3 && l.split(' ').length <= 8) { name = l; break; }
+  }
+
+  const nameIndex = lines.findIndex(l => l === name);
+  const summary = lines.slice(nameIndex + 1, nameIndex + 6).join(' ') || '';
+
+  // simple extractor by headings/key words
+  const lower = lines.map(l => l.toLowerCase());
+  function extract(headers) {
+    const idx = lower.findIndex(l => headers.some(h => l.startsWith(h) || l.includes(h)));
     if (idx === -1) return '';
     let end = lines.length;
     for (let j = idx + 1; j < lower.length; j++) {
@@ -137,20 +159,25 @@ function parseCvSections(text) {
     return lines.slice(idx + 1, end).join('\n');
   }
 
-  sections.experience = extract(['experience', 'work experience', 'employment']);
-  sections.education  = extract(['education', 'academic', 'degree']);
-  sections.skills     = extract(['skills', 'technical skills', 'skill']);
-  sections.projects   = extract(['projects', 'project']);
-  sections.achievements = extract(['achievements', 'awards', 'honours']);
-  sections.contact = extract(['contact', 'email', 'phone', 'linkedin']);
+  const sections = {
+    raw: text,
+    name,
+    summary,
+    experience: extract(['experience', 'work experience', 'employment']),
+    education: extract(['education', 'academic', 'degree']),
+    skills: extract(['skills', 'technical skills', 'skill']),
+    projects: extract(['projects', 'project']),
+    achievements: extract(['achievements', 'awards', 'honours']),
+    contact: extract(['contact', 'email', 'phone', 'linkedin'])
+  };
 
-  // fallback if empty
+  // fallback assignments
   if (!sections.experience && lines.length > 6) sections.experience = lines.slice(6, Math.min(lines.length, 60)).join('\n');
   if (!sections.summary && lines.length > 1) sections.summary = lines.slice(1, 6).join(' ');
   return sections;
 }
 
-// Produce full HTML (standalone)
+/* Generate final standalone HTML using theme params */
 function generateFullHtml(sections, themeType = 'modern', themeColors = 'black', professional = true) {
   const esc = s => sanitizeHtml(String(s || ''), { allowedTags: [], allowedAttributes: {} }).replace(/\n/g, '<br>');
   const primary = (themeColors || '').split(/\s+/)[0] || '#111111';
@@ -212,7 +239,7 @@ function generateFullHtml(sections, themeType = 'modern', themeColors = 'black',
 
     <div class="section">
       <h2>Skills</h2>
-      <div class="card">${sections.skills ? sections.skills.split(/[,\\n]+/).map(s=>'<span class="skill-chip">'+esc(s.trim())+'</span>').join('') : 'No skills found'}</div>
+      <div class="card">${sections.skills ? sections.skills.split(/[,\n]+/).map(s => '<span class="skill-chip">' + esc(s.trim()) + '</span>').join('') : 'No skills found'}</div>
     </div>
 
     <footer>Generated by HTML-Generator · Theme: ${sanitizeHtml(String(themeType))} · Colors: ${sanitizeHtml(String(themeColors))} · Professional: ${professional}</footer>
@@ -221,7 +248,7 @@ function generateFullHtml(sections, themeType = 'modern', themeColors = 'black',
 </html>`;
 }
 
-// Generate endpoint
+// /generate endpoint - prioritizes DeepSeek, then DOCX (mammoth), then PDF (pdf-parse)
 app.post('/generate', async (req, res) => {
   try {
     const {
@@ -236,13 +263,23 @@ app.post('/generate', async (req, res) => {
 
     let cvText = '';
 
-    // 1) Try DeepSeek link first
+    // 1) Try DeepSeek link if provided
     if (deepseekUrl) {
       cvText = await fetchDeepseekText(deepseekUrl);
       console.log('DeepSeek extracted length:', cvText.length);
     }
 
-    // 2) If not enough text then try PDF extraction if file exists
+    // 2) If not enough text, try DOCX using mammoth (preferred for Word)
+    if ((!cvText || cvText.length < 120) && uploadedFilePath && fs.existsSync(uploadedFilePath)) {
+      const ext = path.extname(uploadedFilePath).toLowerCase();
+      if (ext === '.docx' || ext === '.doc') {
+        console.log('Attempting DOCX extraction from', uploadedFilePath);
+        const docxText = await extractTextFromDocx(uploadedFilePath);
+        if (docxText && docxText.length > cvText.length) cvText = docxText;
+      }
+    }
+
+    // 3) If still short, try PDF extraction (if available) or reading raw text as fallback
     if ((!cvText || cvText.length < 120) && uploadedFilePath && fs.existsSync(uploadedFilePath)) {
       const ext = path.extname(uploadedFilePath).toLowerCase();
       if (ext === '.pdf' && pdfParse) {
@@ -250,18 +287,17 @@ app.post('/generate', async (req, res) => {
         const pdfText = await extractTextFromPdf(uploadedFilePath);
         if (pdfText && pdfText.length > cvText.length) cvText = pdfText;
       } else {
-        // try reading as UTF-8 text (for text/DOCX not handled here)
         try {
           const raw = fs.readFileSync(uploadedFilePath, 'utf8');
-          if (raw && raw.length > cvText.length) cvText = raw;
+          if (raw && raw.length > cvText.length) cvText = cleanText(raw);
         } catch (e) {
-          // cannot read as utf8 -> likely binary; will skip
+          // binary/unreadable; skip
         }
       }
     }
 
     if (!cvText || cvText.trim().length < 80) {
-      return res.status(400).json({ ok: false, error: 'Could not extract CV text from DeepSeek link or uploaded file. Ensure DeepSeek share is public or upload a readable PDF.' });
+      return res.status(400).json({ ok: false, error: 'Could not extract CV text from DeepSeek, uploaded DOCX, or uploaded file. Ensure DeepSeek share is public or upload a readable DOCX/PDF.' });
     }
 
     const sections = parseCvSections(cvText);
@@ -273,6 +309,6 @@ app.post('/generate', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('HTML Generator (DeepSeek) running'));
+app.get('/', (req, res) => res.send('HTML Generator (DeepSeek/DOCX) running'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
