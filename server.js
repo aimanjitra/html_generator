@@ -1,48 +1,62 @@
 // server.js
 // DeepSeek + uploaded DOCX/PDF -> Full HTML generator
-// Uses: express, multer (diskStorage to preserve ext), cheerio, mammoth, optional pdf-parse, adm-zip, sanitize-html
+// Uses: express, multer (diskStorage to preserve ext), cheerio, mammoth, optional pdf-parse, adm-zip (optional), sanitize-html
 //
+// Install recommended deps:
 // npm install express multer cheerio mammoth sanitize-html node-fetch adm-zip
-// optional: npm i pdf-parse
+// Optional for PDF extraction:
+// npm i pdf-parse
+//
+// Notes:
+// - adm-zip is optional: when missing the fallback zip-based DOCX parsing is skipped.
+// - pdf-parse is optional: when missing PDF extraction is skipped and the server will attempt other fallbacks.
+// - This file is written to be resilient if optional modules are not installed.
 
 const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
-const fetch = require('node-fetch');
+const fetch = require('node-fetch'); // v2 API
 const cheerio = require('cheerio');
 const sanitizeHtml = require('sanitize-html');
 const mammoth = require('mammoth');
-const AdmZip = require('adm-zip');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // ------------------ CONFIG ------------------
-// Uploads directory
+// where uploaded files will be stored (ensure writable)
 const UPLOAD_DIR = path.resolve(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// DEFAULT fallback file path (change to whichever file you want by default)
-// Developer note: using the path observed in your uploads history.
+// DEFAULT fallback file path (you uploaded files earlier - change if needed)
 const DEFAULT_UPLOADED_FILE_PATH = '/mnt/data/aasss.pdf';
 
-// Optional pdf-parse (install only if you need PDF extraction)
-let pdfParse;
+// ------------------ optional modules (safe) ------------------
+// pdf-parse optional
+let pdfParse = null;
 try {
   pdfParse = require('pdf-parse');
-  console.log('pdf-parse is available: PDF extraction enabled.');
+  console.log('pdf-parse available: PDF extraction enabled.');
 } catch (e) {
-  console.log('pdf-parse not installed — PDF extraction will be skipped unless you `npm i pdf-parse`.');
+  console.log('pdf-parse not installed — PDF extraction disabled. (Install pdf-parse if you want PDF text extraction.)');
 }
 
-// ------------------ multer: preserve original extension ------------------
+// adm-zip optional for zip fallback on docx
+let AdmZip = null;
+try {
+  AdmZip = require('adm-zip');
+  console.log('adm-zip available: zip fallback for docx enabled.');
+} catch (e) {
+  console.log('adm-zip not installed — zip fallback disabled. (Install adm-zip if you want fallback extraction from docx zip.)');
+}
+
+// ------------------ multer storage (preserve extension) ------------------
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
-    // use timestamp + original extension to preserve .pdf/.docx/.doc etc
     const ext = path.extname(file.originalname) || '';
     cb(null, `${Date.now()}${ext}`);
   }
@@ -55,6 +69,9 @@ function cleanText(t) {
   return sanitizeHtml(t, { allowedTags: [], allowedAttributes: {} }).replace(/\r/g, '').trim();
 }
 
+/* Fetch DeepSeek share page and extract meaningful text (best-effort)
+   Removes script/style/iframe to reduce noise and filters JS-like lines.
+*/
 async function fetchDeepseekText(url) {
   try {
     const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 20000 });
@@ -62,6 +79,7 @@ async function fetchDeepseekText(url) {
     const html = await resp.text();
     const $ = cheerio.load(html);
 
+    // reduce noise
     $('script, style, noscript, iframe').remove();
     $('*').each((i, el) => {
       const attribs = el.attribs || {};
@@ -82,6 +100,7 @@ async function fetchDeepseekText(url) {
       if (collected.length > 400) break;
     }
 
+    // fallback: extract body text and filter UI noise
     if (!collected || collected.length < 200) {
       const bodyText = cleanText($('body').text()).replace(/\s{2,}/g, '\n').trim();
       const noise = ['Share', 'Copied', 'OpenAI', 'Sign in', 'Sign up', 'DeepSeek', 'Home', 'About', 'cookie', 'cdn-cgi', '__CF$'];
@@ -93,6 +112,7 @@ async function fetchDeepseekText(url) {
       }).join('\n');
     }
 
+    // final cleanup: drop script-like lines
     collected = collected.split('\n').filter(l => {
       if (/function\s*\(|document\.|cdn-cgi|__CF\$|eval\(/i.test(l)) return false;
       if (l.length > 200 && !/\s/.test(l)) return false;
@@ -101,43 +121,47 @@ async function fetchDeepseekText(url) {
 
     return collected;
   } catch (err) {
-    console.error('fetchDeepseekText error:', err && err.message);
+    console.error('fetchDeepseekText error:', err && (err.message || err));
     return '';
   }
 }
 
-// Try to extract docx using mammoth (pass Buffer)
+// ------------------ DOCX extraction (mammoth preferred) ------------------
 async function extractTextFromDocx(localPath) {
   try {
-    const buffer = fs.readFileSync(localPath); // buffer, not utf8 string
+    const buffer = fs.readFileSync(localPath);
     const result = await mammoth.extractRawText({ buffer });
     const text = (result && result.value) ? result.value : '';
     return cleanText(text);
   } catch (err) {
-    console.warn('mammoth extraction failed:', err && err.message);
+    console.warn('mammoth extraction failed:', err && (err.message || err));
     return '';
   }
 }
 
-// adm-zip fallback for DOCX: read word/document.xml and strip tags
+// adm-zip fallback: read word/document.xml and strip tags (only if adm-zip is available)
 function extractTextFromDocxZipFallback(localPath) {
+  if (!AdmZip) {
+    console.warn('extractTextFromDocxZipFallback: adm-zip not available, skipping fallback.');
+    return '';
+  }
   try {
     const zip = new AdmZip(localPath);
     const entry = zip.getEntry('word/document.xml');
     if (!entry) {
-      console.warn('zip fallback: word/document.xml not found');
+      console.warn('zip fallback: word/document.xml not found in docx archive.');
       return '';
     }
     const xml = entry.getData().toString('utf8');
     const text = xml.replace(/<[^>]+>/g, ' ').replace(/\s{2,}/g, ' ').trim();
     return cleanText(text);
   } catch (err) {
-    console.warn('zip fallback failed:', err && err.message);
+    console.warn('zip fallback failed:', err && (err.message || err));
     return '';
   }
 }
 
-// PDF extraction (optional)
+// ------------------ PDF extraction (optional) ------------------
 async function extractTextFromPdf(localPath) {
   if (!pdfParse) return '';
   try {
@@ -145,7 +169,7 @@ async function extractTextFromPdf(localPath) {
     const data = await pdfParse(buffer);
     return (data && data.text) ? cleanText(data.text) : '';
   } catch (err) {
-    console.warn('pdf-parse extraction failed:', err && err.message);
+    console.warn('pdf-parse extraction failed:', err && (err.message || err));
     return '';
   }
 }
@@ -154,7 +178,6 @@ async function extractTextFromPdf(localPath) {
 app.post('/upload-cv', upload.single('cv'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
-    // send back the exact full path on server (with extension preserved)
     const localPath = path.resolve(req.file.path);
     return res.json({
       ok: true,
@@ -163,8 +186,8 @@ app.post('/upload-cv', upload.single('cv'), async (req, res) => {
       localPath
     });
   } catch (err) {
-    console.error('upload error:', err);
-    return res.status(500).json({ ok: false, error: err.message });
+    console.error('upload error:', err && (err.stack || err.message || err));
+    return res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
@@ -173,6 +196,7 @@ function parseCvSections(text) {
   const trimmed = (text || '').replace(/\r/g, '').trim();
   const lines = trimmed.split('\n').map(l => l.trim()).filter(Boolean);
 
+  // name heuristics: first non-noise short-ish line
   let name = 'Candidate Name';
   for (let i = 0; i < Math.min(6, lines.length); i++) {
     const l = lines[i];
@@ -280,6 +304,11 @@ footer{border-top:1px solid #eee;padding-top:12px;color:#777;font-size:13px;marg
 }
 
 // ------------------ /generate endpoint ------------------
+// Priority:
+// 1) deepseekUrl (if provided)
+// 2) DOCX (.docx) -> mammoth, then adm-zip fallback if mammoth returns little and adm-zip installed
+// 3) PDF (.pdf) -> pdf-parse (if installed)
+// 4) try reading file as utf8 plain text
 app.post('/generate', async (req, res) => {
   try {
     const {
@@ -294,13 +323,13 @@ app.post('/generate', async (req, res) => {
 
     let cvText = '';
 
-    // 1) DeepSeek first
+    // 1) DeepSeek
     if (deepseekUrl) {
       cvText = await fetchDeepseekText(deepseekUrl);
       console.log('DeepSeek extracted length:', cvText.length);
     }
 
-    // 2) If not enough text, attempt DOCX extraction (mammoth) if file present
+    // 2) DOCX extraction (prefer mammoth)
     if ((!cvText || cvText.length < 120) && uploadedFilePath && fs.existsSync(uploadedFilePath)) {
       const ext = path.extname(uploadedFilePath).toLowerCase();
       if (ext === '.docx') {
@@ -308,27 +337,20 @@ app.post('/generate', async (req, res) => {
         const docxText = await extractTextFromDocx(uploadedFilePath);
         if ((!cvText || docxText.length > cvText.length) && docxText && docxText.length > 20) cvText = docxText;
 
+        // If mammoth yields little, try zip fallback (if adm-zip present)
         if ((!cvText || cvText.length < 80)) {
-          console.log('Mammoth returned little text; trying zip fallback...');
+          console.log('Mammoth returned little text; trying zip fallback (if available)...');
           const fallback = extractTextFromDocxZipFallback(uploadedFilePath);
           if (fallback && fallback.length > cvText.length) cvText = fallback;
         }
       } else if (ext === '.doc') {
-        // .doc is the older binary Word format. Mammoth does not parse it reliably.
-        // Best practice: convert .doc -> .docx (LibreOffice) on the server, then run mammoth.
-        // You can optionally enable automatic conversion with LibreOffice CLI if available:
-        //
-        // Example (optional):
-        // const { execSync } = require('child_process');
-        // const converted = uploadedFilePath + '.converted.docx';
-        // execSync(`soffice --headless --convert-to docx --outdir ${path.dirname(uploadedFilePath)} ${uploadedFilePath}`);
-        // then set uploadedFilePath = path.join(path.dirname(uploadedFilePath), '<converted-filename>.docx')
-        //
-        console.log('.doc uploaded: convert to .docx (LibreOffice) for best results or ask user to upload .docx.');
+        // .doc: older Word format — best to convert to .docx (LibreOffice) before parsing.
+        // Optionally: integrate a conversion step with LibreOffice CLI if available in your environment.
+        console.log('.doc uploaded: mammoth does not reliably parse .doc. Convert .doc -> .docx (libreoffice soffice) for best results or ask user to upload .docx.');
       }
     }
 
-    // 3) PDF fallback (pdf-parse) or try reading raw text
+    // 3) PDF extraction (optional) or read as text fallback
     if ((!cvText || cvText.length < 120) && uploadedFilePath && fs.existsSync(uploadedFilePath)) {
       const ext = path.extname(uploadedFilePath).toLowerCase();
       if (ext === '.pdf' && pdfParse) {
@@ -336,12 +358,13 @@ app.post('/generate', async (req, res) => {
         const pdfText = await extractTextFromPdf(uploadedFilePath);
         if (pdfText && pdfText.length > cvText.length) cvText = pdfText;
       } else {
-        // try reading plain text (for plain text or server-saved HTML)
+        // try reading raw utf8 (works for text files or HTML snapshots)
         try {
           const raw = fs.readFileSync(uploadedFilePath, 'utf8');
           if (raw && raw.length > cvText.length) cvText = cleanText(raw);
         } catch (e) {
-          // unreadable as utf8 (likely binary) - nothing to do
+          // unreadable as utf8 -> likely binary. nothing else to do.
+          console.log('File unreadable as text (likely binary).');
         }
       }
     }
