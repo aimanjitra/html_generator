@@ -1,5 +1,6 @@
 // server.js
-// DeepSeek-share-link based CV → Full HTML generator (cleaner extraction + theme handling)
+// DeepSeek-share-link based CV -> Full HTML generator
+// Tries DeepSeek first; falls back to PDF extraction (pdf-parse) if available.
 
 const express = require('express');
 const multer = require('multer');
@@ -14,54 +15,48 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Upload folder
 const upload = multer({ dest: 'uploads/' });
 
-// DEFAULT uploaded file path you provided earlier (keep it if you're using that local file)
-const DEFAULT_UPLOADED_FILE_PATH = '/mnt/data/f124d69d-5701-4fec-9c21-e5db7eecd1cc.png';
+// <-- IMPORTANT: default local file path you uploaded earlier -->
+const DEFAULT_UPLOADED_FILE_PATH = '/mnt/data/CV Aiman.pdf';
 
-// sanitize text helper
-function cleanText(t) {
-  if (!t) return '';
-  return sanitizeHtml(t, { allowedTags: [], allowedAttributes: {} })
-    .replace(/\r/g, '')
-    .trim();
+// Try to require pdf-parse optionally
+let pdfParse;
+try {
+  pdfParse = require('pdf-parse');
+  console.log('pdf-parse available: will attempt PDF extraction.');
+} catch (e) {
+  console.log('pdf-parse not installed or failed to load — PDF extraction will be skipped.');
 }
 
-// Upload CV: returns localPath
+// helper: sanitize text
+function cleanText(t) {
+  if (!t) return '';
+  return sanitizeHtml(t, { allowedTags: [], allowedAttributes: {} }).replace(/\r/g, '').trim();
+}
+
+// Upload endpoint
 app.post('/upload-cv', upload.single('cv'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
     const localPath = path.resolve(req.file.path);
-    return res.json({
-      ok: true,
-      filename: req.file.filename,
-      originalname: req.file.originalname,
-      localPath
-    });
+    return res.json({ ok: true, filename: req.file.filename, originalname: req.file.originalname, localPath });
   } catch (err) {
+    console.error(err);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-/*
-  Fetch DeepSeek share page and extract meaningful text.
-  Improved strategy:
-   - Remove <script>, <noscript>, <style>, and inline event handlers
-   - Pull from common selectors
-   - Filter out code-like lines (cdn-cgi, function(...), document., long one-line base64/js blobs)
-*/
+// Fetch and extract text from DeepSeek share page (best-effort)
 async function fetchDeepseekText(url) {
   try {
-    const res = await fetch(url, { method: 'GET', headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 20000 });
-    if (!res.ok) throw new Error(`Fetch failed with status ${res.status}`);
-    const html = await res.text();
+    const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 20000 });
+    if (!resp.ok) throw new Error('DeepSeek page not accessible, status: ' + resp.status);
+    const html = await resp.text();
     const $ = cheerio.load(html);
 
-    // remove script/style/noscript elements entirely
+    // remove script/style/noscript/iframe nodes to reduce noise
     $('script, style, noscript, iframe').remove();
-
-    // remove attributes that might contain JS
     $('*').each((i, el) => {
       const attribs = el.attribs || {};
       for (const a of Object.keys(attribs)) {
@@ -69,10 +64,9 @@ async function fetchDeepseekText(url) {
       }
     });
 
-    // try several selectors that could contain chat text
     const selectors = ['article', '.chat', '.message', '.prose', '#root', 'main', '.chat-message', '.message-content'];
-
     let collected = '';
+
     for (const sel of selectors) {
       const el = $(sel);
       if (el && el.length) {
@@ -84,73 +78,58 @@ async function fetchDeepseekText(url) {
       if (collected.length > 400) break;
     }
 
-    // fallback: extract full body text and then filter noise
+    // fallback: body text filtered
     if (!collected || collected.length < 200) {
-      let bodyText = cleanText($('body').text() || '');
-      // split into lines then filter out script/noise lines
-      let lines = bodyText.split('\n').map(l => l.trim()).filter(Boolean);
-
-      // remove lines that appear script-like or tiny
-      const noisePatterns = [
-        /^<\s*script/i,
-        /cdn-cgi/i,
-        /window\.__CF|__CF\$cv|__cf/i,
-        /function\s*\(/i,
-        /document\./i,
-        /^[\{\};=\/\(\)]+$/,
-        /^[\w+=\/]{60,}$/ // very long base64 or blob-like lines
-      ];
-      lines = lines.filter(line => {
-        for (const pat of noisePatterns) if (pat.test(line)) return false;
-        // remove lines that are just UI labels
-        if (/^(Share|Copied|Sign in|Sign up|Home|About|OpenAI|DeepSeek)$/i.test(line)) return false;
-        return line.length > 2;
-      });
-
-      collected = lines.join('\n\n');
+      const bodyText = cleanText($('body').text()).replace(/\s{2,}/g, '\n').trim();
+      const noise = ['Share', 'Copied', 'OpenAI', 'Sign in', 'Sign up', 'DeepSeek', 'Home', 'About', 'cookie', 'cdn-cgi', '__CF$'];
+      collected = bodyText.split('\n').filter(line => {
+        const s = line.trim();
+        if (s.length < 4) return false;
+        for (const n of noise) if (s.includes(n)) return false;
+        return true;
+      }).join('\n');
     }
 
-    // final pass: remove sequences of many non-letter characters and long single-line JS remnants
+    // filter JS-like remaining lines
     collected = collected.split('\n').filter(l => {
-      // drop lines that are probably leftover JS
-      if (/^[\s\W]{10,}$/.test(l)) return false;
-      if (/function\s*\(|document\.|cdn-cgi|__CF\$|eval\(|<script/i.test(l)) return false;
-      // drop extremely long single-line tokens without spaces (typical base64 or JS blobs)
-      if (l.length > 200 && !/\s/.test(l)) return false;
-      return true;
+      if (/function\s*\(|document\.|cdn-cgi|__CF\$|eval\(/i.test(l)) return false;
+      if (l.length > 200 && !/\s/.test(l)) return false; // long base64-ish lines
+      return l.trim().length > 0;
     }).join('\n').replace(/\n{3,}/g, '\n\n').trim();
 
     return collected;
   } catch (err) {
-    console.error('fetchDeepseekText error:', err);
+    console.error('fetchDeepseekText error:', err.message || err);
     return '';
   }
 }
 
-// parse text heuristically into sections
-function parseCvSections(text) {
-  const trimmed = (text || '').replace(/\r/g, '').trim();
-  const lines = trimmed.split('\n').map(l => l.trim()).filter(Boolean);
-
-  // find first meaningful line as name
-  let name = 'Candidate Name';
-  for (let i = 0; i < Math.min(6, lines.length); i++) {
-    const l = lines[i];
-    // skip lines that look like code or noise
-    if (/function\s*\(|document\.|cdn-cgi|__CF\$|https?:\/\//i.test(l)) continue;
-    if (l.length > 3 && l.split(' ').length <= 8) { name = l; break; }
+// Optional: extract text with pdf-parse if available
+async function extractTextFromPdf(localPath) {
+  if (!pdfParse) return '';
+  try {
+    const buffer = fs.readFileSync(localPath);
+    const data = await pdfParse(buffer);
+    return (data && data.text) ? data.text : '';
+  } catch (err) {
+    console.warn('PDF extraction failed:', err.message || err);
+    return '';
   }
+}
 
-  // summary: take lines after name (up to 6)
-  const nameIndex = lines.findIndex(l => l === name);
-  const summary = lines.slice(nameIndex + 1, nameIndex + 6).join(' ') || '';
+// Heuristic: parse CV-like sections from text
+function parseCvSections(text) {
+  const lines = (text || '').split('\n').map(l => l.trim()).filter(Boolean);
+  const sections = {
+    raw: text,
+    name: lines[0] || 'Candidate Name',
+    summary: lines.slice(1, 6).join(' ')
+  };
 
-  // naive section extractor based on headings keywords
-  const lower = lines.map(l => l.toLowerCase());
-  function extract(headerKeys) {
-    const idx = lower.findIndex(l => headerKeys.some(h => l.startsWith(h) || l.includes(h)));
+  function extract(headerKeywords) {
+    const lower = lines.map(l => l.toLowerCase());
+    const idx = lower.findIndex(l => headerKeywords.some(h => l.startsWith(h) || l.includes(h)));
     if (idx === -1) return '';
-    // find next header
     let end = lines.length;
     for (let j = idx + 1; j < lower.length; j++) {
       if (['experience','education','skills','projects','achievements','certificat','contact','summary'].some(h => lower[j].includes(h))) { end = j; break; }
@@ -158,60 +137,53 @@ function parseCvSections(text) {
     return lines.slice(idx + 1, end).join('\n');
   }
 
-  const sections = {
-    raw: text,
-    name,
-    summary,
-    experience: extract(['experience','work experience','employment']),
-    education: extract(['education','academic','degree']),
-    skills: extract(['skills','technical skills','skill']),
-    projects: extract(['projects','project']),
-    achievements: extract(['achievements','awards','honours']),
-    contact: extract(['contact','email','phone','linkedin'])
-  };
+  sections.experience = extract(['experience', 'work experience', 'employment']);
+  sections.education  = extract(['education', 'academic', 'degree']);
+  sections.skills     = extract(['skills', 'technical skills', 'skill']);
+  sections.projects   = extract(['projects', 'project']);
+  sections.achievements = extract(['achievements', 'awards', 'honours']);
+  sections.contact = extract(['contact', 'email', 'phone', 'linkedin']);
 
-  // if no headings found, fallback: assign some chunk into experience
-  if (!sections.experience && lines.length > 6) {
-    sections.experience = lines.slice(6, Math.min(lines.length, 40)).join('\n');
-  }
-
+  // fallback if empty
+  if (!sections.experience && lines.length > 6) sections.experience = lines.slice(6, Math.min(lines.length, 60)).join('\n');
+  if (!sections.summary && lines.length > 1) sections.summary = lines.slice(1, 6).join(' ');
   return sections;
 }
 
-// produce final HTML using the theme params
-function generateFullHtml(sections, themeType='modern', themeColors='black', professional=true) {
-  function esc(s) {
-    return sanitizeHtml(String(s || ''), { allowedTags: [], allowedAttributes: {} }).replace(/\n/g, '<br>');
-  }
+// Produce full HTML (standalone)
+function generateFullHtml(sections, themeType = 'modern', themeColors = 'black', professional = true) {
+  const esc = s => sanitizeHtml(String(s || ''), { allowedTags: [], allowedAttributes: {} }).replace(/\n/g, '<br>');
   const primary = (themeColors || '').split(/\s+/)[0] || '#111111';
   const accent = '#6c5ce7';
 
   return `<!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>${esc(sections.name)} — CV Website</title>
 <style>
-  :root{--primary:${primary};--accent:${accent};--bg:#fff;--text:#222}
-  body{font-family:Inter,system-ui,Segoe UI,Arial;padding:24px;background:#f6f8fb;color:var(--text)}
-  .wrap{max-width:980px;margin:auto;background:var(--bg);padding:28px;border-radius:12px;box-shadow:0 10px 30px rgba(20,20,40,.06)}
-  header{display:flex;gap:18px;align-items:center;border-bottom:1px solid #eee;padding-bottom:18px;margin-bottom:18px}
-  .avatar{width:90px;height:90px;border-radius:14px;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;color:white;font-weight:700;font-size:28px}
-  h1{margin:0;font-size:24px}
+  :root{--primary:${primary};--accent:${accent};--bg:#ffffff;--text:#222}
+  body{font-family:Inter, Arial, sans-serif;background:#f6f8fb;margin:0;padding:24px;color:var(--text)}
+  .wrap{max-width:980px;margin:36px auto;background:var(--bg);border-radius:12px;padding:28px;box-shadow:0 10px 30px rgba(20,20,40,.06)}
+  header{display:flex;gap:18px;align-items:center;border-bottom:1px solid #eee;padding-bottom:18px;margin-bottom:20px}
+  .avatar{width:96px;height:96px;border-radius:14px;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:28px}
+  h1{margin:0;font-size:28px}
   .meta{color:#666;margin-top:6px}
-  .section{margin-bottom:18px}
-  .section h2{color:var(--primary);margin:0 0 8px 0}
+  .section{margin-bottom:20px}
+  .section h2{margin:0 0 8px 0;color:var(--primary);font-size:18px}
   .card{background:#fbfbff;padding:12px;border-radius:10px;border:1px solid #f0f0ff}
-  .skill{display:inline-block;padding:6px 10px;margin:4px;border-radius:999px;background:#f2f3ff;font-size:13px}
-  footer{margin-top:28px;color:#666;font-size:13px}
+  .skill-chip{display:inline-block;padding:6px 10px;margin:6px 6px 0 0;border-radius:999px;background:#f2f3ff;font-size:13px}
   pre{white-space:pre-wrap;font-family:inherit}
+  footer{border-top:1px solid #eee;padding-top:12px;color:#777;font-size:13px;margin-top:28px}
+  .pulse{animation:pulse 2.2s infinite}
+  @keyframes pulse{0%{transform:translateY(0)}50%{transform:translateY(-2px)}100%{transform:translateY(0)}}
 </style>
 </head>
 <body>
   <div class="wrap">
     <header>
-      <div class="avatar">${(sections.name && sections.name[0]) || 'A'}</div>
+      <div class="avatar pulse">${(sections.name && sections.name[0]) || 'A'}</div>
       <div>
         <h1>${esc(sections.name)}</h1>
         <div class="meta">${esc(sections.summary)}</div>
@@ -220,7 +192,7 @@ function generateFullHtml(sections, themeType='modern', themeColors='black', pro
 
     <div class="section">
       <h2>Experience</h2>
-      <div class="card"><pre>${esc(sections.experience || 'No experience found.')}</pre></div>
+      <div class="card"><pre>${esc(sections.experience || 'No experience section found.')}</pre></div>
     </div>
 
     <div class="section">
@@ -230,22 +202,20 @@ function generateFullHtml(sections, themeType='modern', themeColors='black', pro
 
     <div class="section">
       <h2>Education</h2>
-      <div class="card"><pre>${esc(sections.education || 'No education found.')}</pre></div>
+      <div class="card"><pre>${esc(sections.education || 'No education section found.')}</pre></div>
     </div>
 
     <div class="section">
       <h2>Achievements</h2>
-      <div class="card"><pre>${esc(sections.achievements || '')}</pre></div>
+      <div class="card"><pre>${esc(sections.achievements || 'No achievements listed.')}</pre></div>
     </div>
 
     <div class="section">
       <h2>Skills</h2>
-      <div class="card">
-        ${sections.skills ? sections.skills.split(/[,\\n]+/).map(s=>`<span class="skill">${esc(s)}</span>`).join('') : 'No skills found'}
-      </div>
+      <div class="card">${sections.skills ? sections.skills.split(/[,\\n]+/).map(s=>'<span class="skill-chip">'+esc(s.trim())+'</span>').join('') : 'No skills found'}</div>
     </div>
 
-    <footer>Theme: ${sanitizeHtml(String(themeType))} | Colors: ${sanitizeHtml(String(themeColors))} | Professional: ${professional}</footer>
+    <footer>Generated by HTML-Generator · Theme: ${sanitizeHtml(String(themeType))} · Colors: ${sanitizeHtml(String(themeColors))} · Professional: ${professional}</footer>
   </div>
 </body>
 </html>`;
@@ -262,39 +232,47 @@ app.post('/generate', async (req, res) => {
       uploadedFilePath = DEFAULT_UPLOADED_FILE_PATH
     } = req.body || {};
 
-    console.log('Received from frontend:', { deepseekUrl, themeType, themeColors, professional, uploadedFilePath });
+    console.log('generate request payload:', { deepseekUrl, themeType, themeColors, professional, uploadedFilePath });
 
     let cvText = '';
 
-    // If a DeepSeek link provided - try fetch & parse
+    // 1) Try DeepSeek link first
     if (deepseekUrl) {
       cvText = await fetchDeepseekText(deepseekUrl);
+      console.log('DeepSeek extracted length:', cvText.length);
     }
 
-    // fallback: if uploaded file is a PDF and present we could try pdf-parse, but pdf-parse may not be installed => skip here.
-    // If cvText still empty, try reading uploadedFilePath as text
-    if ((!cvText || cvText.length < 50) && uploadedFilePath && fs.existsSync(uploadedFilePath)) {
-      try {
-        const maybe = fs.readFileSync(uploadedFilePath, 'utf8');
-        if (maybe && maybe.length > 50) cvText = maybe;
-      } catch (e) {
-        // ignore binary files
+    // 2) If not enough text then try PDF extraction if file exists
+    if ((!cvText || cvText.length < 120) && uploadedFilePath && fs.existsSync(uploadedFilePath)) {
+      const ext = path.extname(uploadedFilePath).toLowerCase();
+      if (ext === '.pdf' && pdfParse) {
+        console.log('Attempting PDF extraction from', uploadedFilePath);
+        const pdfText = await extractTextFromPdf(uploadedFilePath);
+        if (pdfText && pdfText.length > cvText.length) cvText = pdfText;
+      } else {
+        // try reading as UTF-8 text (for text/DOCX not handled here)
+        try {
+          const raw = fs.readFileSync(uploadedFilePath, 'utf8');
+          if (raw && raw.length > cvText.length) cvText = raw;
+        } catch (e) {
+          // cannot read as utf8 -> likely binary; will skip
+        }
       }
     }
 
-    if (!cvText || cvText.trim().length < 50) {
-      return res.status(400).json({ ok: false, error: 'Could not extract meaningful text from DeepSeek link or uploaded file. Make sure the DeepSeek share is public and contains the chat content.' });
+    if (!cvText || cvText.trim().length < 80) {
+      return res.status(400).json({ ok: false, error: 'Could not extract CV text from DeepSeek link or uploaded file. Ensure DeepSeek share is public or upload a readable PDF.' });
     }
 
     const sections = parseCvSections(cvText);
     const html = generateFullHtml(sections, themeType, themeColors, professional);
-
     return res.json({ ok: true, html });
   } catch (err) {
     console.error('generate error:', err);
-    return res.status(500).json({ ok: false, error: err.message });
+    return res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
-app.get('/', (req, res) => res.send('HTML Generator DeepSeek Edition Running'));
-app.listen(process.env.PORT || 3000, () => console.log('Server running'));
+app.get('/', (req, res) => res.send('HTML Generator (DeepSeek) running'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
