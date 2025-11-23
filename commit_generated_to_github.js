@@ -21,11 +21,11 @@ const GENERATE_URL = BASE.replace(/\/$/, '') + '/generate';
 const LOCAL_FILE_TO_UPLOAD = '/mnt/data/aasss.pdf'; // <-- path taken from conversation history
 
 // GitHub config (from env)
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const GITHUB_OWNER = process.env.GITHUB_OWNER || 'your-github-username';
-const GITHUB_REPO  = process.env.GITHUB_REPO  || 'your-repo';
-const GITHUB_PATH  = process.env.GITHUB_PATH  || 'generated/cv-aasss.html';
-const COMMIT_MSG   = process.env.COMMIT_MSG   || 'Add generated CV site (aasss)';
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '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';
+const GITHUB_OWNER = process.env.GITHUB_OWNER || 'aimanjitra';
+const GITHUB_REPO  = process.env.GITHUB_REPO  || 'html_generator';
+const GITHUB_PATH  = process.env.GITHUB_PATH  || 'nxt.html';
+const COMMIT_MSG   = process.env.COMMIT_MSG   || 'Update nxt.html with generated website';
 
 if (!GITHUB_TOKEN) {
   console.error('Set GITHUB_TOKEN in env.');
