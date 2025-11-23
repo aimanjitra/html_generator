@@ -1,6 +1,6 @@
 // server.js
-// Backend using Express that uploads CV, extracts PDF text (if PDF), and calls OpenAI Chat API
-// NOTE: set OPENAI_API_KEY in your Render environment variables
+// Uses DeepSeek share URL as source; parses content and generates a full HTML website locally.
+// No OpenAI call required.
 
 const express = require('express');
 const multer = require('multer');
@@ -8,7 +8,8 @@ const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
 const fetch = require('node-fetch'); // v2 style
-const pdfParse = require('pdf-parse'); // npm i pdf-parse
+const cheerio = require('cheerio');
+const sanitizeHtml = require('sanitize-html');
 
 const app = express();
 app.use(cors());
@@ -17,35 +18,20 @@ app.use(express.json());
 // Multer setup - saves to uploads/ directory
 const upload = multer({ dest: 'uploads/' });
 
-// Default uploaded file (you said this path earlier)
+// Default uploaded file (developer-provided path)
 const DEFAULT_UPLOADED_FILE_PATH = '/mnt/data/f124d69d-5701-4fec-9c21-e5db7eecd1cc.png';
 
-// Helper: extract text if PDF
-async function extractTextIfPdf(localPath) {
-  if (!localPath || !fs.existsSync(localPath)) return '';
-  const ext = path.extname(localPath).toLowerCase();
-  try {
-    const buffer = fs.readFileSync(localPath);
-    if (ext === '.pdf') {
-      const data = await pdfParse(buffer);
-      return (data && data.text) ? data.text : '';
-    }
-    // For images or other binary files - we don't OCR here; return empty so prompt uses deepseekUrl
-    return '';
-  } catch (err) {
-    console.error('extractTextIfPdf error:', err);
-    return '';
-  }
+// Utility: sanitize text for safety
+function cleanText(t) {
+  if (!t) return '';
+  return sanitizeHtml(t, { allowedTags: [], allowedAttributes: {} }).replace(/\r/g, '');
 }
 
-// Upload CV endpoint - returns info about uploaded file
+// Upload endpoint (unchanged)
 app.post('/upload-cv', upload.single('cv'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
-
-    // Optionally you can move the file to a public location or serve it from your server.
-    // For now return the local path so you can use it in /generate payload.
-    const localPath = path.resolve(req.file.path); // e.g., uploads/abcd
+    const localPath = path.resolve(req.file.path);
     return res.json({
       ok: true,
       filename: req.file.filename,
@@ -58,7 +44,226 @@ app.post('/upload-cv', upload.single('cv'), async (req, res) => {
   }
 });
 
-// Generate endpoint: uses OpenAI Chat API to request full HTML
+// Fetch DeepSeek share page and extract text.
+// If the page uses dynamic JS to render content this still often contains the chat content in the HTML snapshot for share pages.
+async function fetchDeepseekText(url) {
+  try {
+    const res = await fetch(url, { method: 'GET', headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 20000 });
+    if (!res.ok) {
+      throw new Error(`Fetch failed with status ${res.status}`);
+    }
+    const html = await res.text();
+    const $ = cheerio.load(html);
+
+    // Heuristic extraction:
+    // Try common selectors that might hold chat content; otherwise fallback to main body text.
+    // We will collect text nodes that look meaningful (non-empty and not navigation).
+    const selectors = [
+      'article',          // sometimes chat content is in article
+      '.chat',            // general
+      '.message',         // common name
+      '.chat-message',
+      '.prose',
+      '#root',
+      'main'
+    ];
+
+    let collected = '';
+    for (const sel of selectors) {
+      const el = $(sel);
+      if (el && el.length) {
+        // gather text from found elements but filter out tiny bits
+        el.each((i, node) => {
+          const txt = cleanText($(node).text()).trim();
+          if (txt.length > 20) collected += txt + '\n\n';
+        });
+        if (collected.trim().length > 200) break;
+      }
+    }
+
+    // fallback: get big body text but filter out common UI strings
+    if (!collected || collected.trim().length < 100) {
+      const bodyText = cleanText($('body').text()).replace(/\s{2,}/g, '\n').trim();
+      // remove obvious navigation words that pollute result
+      const noise = ['Share', 'Copied', 'OpenAI', 'Sign in', 'Sign up', 'DeepSeek', 'Home', 'About'];
+      let filtered = bodyText.split('\n').filter(line => {
+        const s = line.trim();
+        if (s.length < 4) return false;
+        for (const n of noise) if (s.includes(n)) return false;
+        return true;
+      }).join('\n');
+      collected = filtered;
+    }
+
+    // final cleanup
+    collected = collected.replace(/\n{3,}/g, '\n\n').trim();
+    return collected;
+  } catch (err) {
+    console.error('fetchDeepseekText error:', err);
+    return '';
+  }
+}
+
+// Simple rule-based extraction to split into CV sections from a chunk of text.
+// This is heuristic: looks for common headings (Experience, Education, Skills, Projects, Contact)
+function parseCvSections(text) {
+  const lower = text.replace(/\r/g, '');
+  const lines = lower.split('\n').map(l => l.trim()).filter(l => l);
+  const joined = lines.join('\n');
+
+  // find known headings positions
+  const headings = ['experience', 'education', 'skills', 'projects', 'contact', 'summary', 'achievements', 'certifications'];
+  const sections = {};
+  // naive approach: find positions of headings and slice ranges
+  const linesLower = lines.map(l => l.toLowerCase());
+  let idxMap = [];
+  for (let i = 0; i < linesLower.length; i++) {
+    if (headings.includes(linesLower[i])) idxMap.push({ name: linesLower[i], i });
+  }
+
+  // if no headings found, attempt to detect by keywords
+  if (idxMap.length === 0) {
+    // try to detect "experience" word inside lines
+    lines.forEach((ln, i) => {
+      const ll = ln.toLowerCase();
+      headings.forEach(h => {
+        if (ll.includes(h) && !idxMap.find(x => x.name===h)) idxMap.push({ name: h, i });
+      });
+    });
+  }
+
+  // if still empty, create a simple split: first line = name/title, next 3 lines = summary, rest = experience
+  if (idxMap.length === 0) {
+    sections.name = lines[0] || '';
+    sections.summary = lines.slice(1, 6).join(' ');
+    sections.experience = lines.slice(6).join('\n');
+    return sections;
+  }
+
+  // build sections from idxMap
+  idxMap.sort((a,b) => a.i - b.i);
+  for (let s = 0; s < idxMap.length; s++) {
+    const start = idxMap[s].i + 1; // content after heading
+    const end = (s + 1 < idxMap.length) ? idxMap[s+1].i : lines.length;
+    const key = idxMap[s].name;
+    sections[key] = lines.slice(start, end).join('\n');
+  }
+
+  // set name and summary heuristically
+  sections.name = lines[0] || '';
+  if (!sections.summary && lines.length > 1) {
+    sections.summary = lines.slice(1, Math.min(6, lines.length)).join(' ');
+  }
+  return sections;
+}
+
+// Template: produce a full HTML page from parsed sections and theme preferences
+function generateFullHtml(sections, themeType='modern', themeColors='black', professional=true) {
+  // Minimal color parsing: take first token as primary color; fallback to #111
+  const colorToken = (themeColors || '').split(/\s+/)[0] || '';
+  const primaryColor = (colorToken && /^#/.test(colorToken)) ? colorToken : (colorToken || '#0a0a0a');
+  const accent = '#6c5ce7';
+
+  // Build a safe escaped HTML content from sections
+  function esc(s) { return sanitizeHtml(String(s||''), { allowedTags: [], allowedAttributes: {} }).replace(/\n/g, '<br>'); }
+
+  const name = esc(sections.name || 'Candidate Name');
+  const summary = esc(sections.summary || '');
+  const experience = esc(sections.experience || '');
+  const education = esc(sections.education || '');
+  const skills = esc(sections.skills || '');
+  const projects = esc(sections.projects || '');
+  const achievements = esc(sections.achievements || '');
+
+  // full HTML
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>${name} — CV Website</title>
+<style>
+  :root{
+    --primary: ${primaryColor};
+    --accent: ${accent};
+    --bg: #ffffff;
+    --text: #222222;
+  }
+  body{font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background: #f6f8fb; color:var(--text); margin:0; padding:28px}
+  .wrap{max-width:980px;margin:auto;background:var(--bg);border-radius:12px;padding:28px;box-shadow:0 10px 30px rgba(20,20,40,.06)}
+  header{display:flex;align-items:center;gap:18px;border-bottom:1px solid #eee;padding-bottom:18px;margin-bottom:20px}
+  .avatar{width:96px;height:96px;border-radius:14px;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;color:white;font-weight:700;font-size:28px}
+  h1{margin:0;font-size:28px}
+  .meta{color:#666;margin-top:6px}
+  .section{margin-bottom:20px}
+  .section h2{margin:0 0 8px 0;color:var(--primary);font-size:18px}
+  .two-col{display:flex;gap:24px}
+  .left{flex:3}
+  .right{flex:1;min-width:220px}
+  .skill-chip{display:inline-block;padding:6px 10px;margin:6px 6px 0 0;border-radius:999px;background:#f2f3ff;color:#222;font-size:13px}
+  .card{background:#fbfbff;padding:12px;border-radius:10px;border:1px solid #f0f0ff}
+  footer{border-top:1px solid #eee;padding-top:12px;color:#777;font-size:14px;margin-top:30px}
+  /* subtle animation */
+  .pulse{animation:pulse 2.2s infinite}
+  @keyframes pulse{0%{transform:translateY(0)}50%{transform:translateY(-2px)}100%{transform:translateY(0)}}
+  pre{white-space:pre-wrap;font-family:inherit}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="avatar pulse">${(name && name[0]) || 'A'}</div>
+      <div>
+        <h1>${name}</h1>
+        <div class="meta">${summary}</div>
+      </div>
+    </header>
+
+    <div class="two-col">
+      <div class="left">
+        <div class="section">
+          <h2>Experience</h2>
+          <div class="card"><pre>${experience || 'No experience section found.'}</pre></div>
+        </div>
+
+        <div class="section">
+          <h2>Projects</h2>
+          <div class="card"><pre>${projects || 'No projects listed.'}</pre></div>
+        </div>
+
+        <div class="section">
+          <h2>Education</h2>
+          <div class="card"><pre>${education || 'No education section found.'}</pre></div>
+        </div>
+
+        <div class="section">
+          <h2>Achievements</h2>
+          <div class="card"><pre>${achievements || 'No achievements listed.'}</pre></div>
+        </div>
+      </div>
+
+      <aside class="right">
+        <div class="section">
+          <h2>Skills</h2>
+          <div class="card">${skills ? skills.split(/[,\n]+/).map(s=>`<span class="skill-chip">${s.trim()}</span>`).join('') : '<div>No skills found.</div>'}</div>
+        </div>
+
+        <div class="section">
+          <h2>Contact</h2>
+          <div class="card"><pre>${sections.contact || 'No contact info found.'}</pre></div>
+        </div>
+      </aside>
+    </div>
+
+    <footer>Generated by HTML-Generator · Theme: ${themeType} · Colors: ${themeColors} · Professional: ${professional}</footer>
+  </div>
+</body>
+</html>`;
+
+  return html;
+}
+
+// Main generate endpoint using DeepSeek source
 app.post('/generate', async (req, res) => {
   try {
     const {
@@ -66,87 +271,64 @@ app.post('/generate', async (req, res) => {
       themeType = 'modern',
       themeColors = 'black',
       professional = true,
-      // uploadedFilePath can be provided by frontend (from upload response) or use default local path:
       uploadedFilePath = DEFAULT_UPLOADED_FILE_PATH
     } = req.body || {};
 
-    // Extract CV text (if PDF) from local path - this makes model grounded to real CV content
+    // 1) Prefer extracting text from uploaded file (if it's a pdf)
     let cvText = '';
-    if (uploadedFilePath) {
-      cvText = await extractTextIfPdf(uploadedFilePath);
+    try {
+      if (uploadedFilePath && fs.existsSync(uploadedFilePath) && path.extname(uploadedFilePath).toLowerCase() === '.pdf') {
+        // attempt pdf-parse if available
+        try {
+          const pdfParse = require('pdf-parse');
+          const buffer = fs.readFileSync(uploadedFilePath);
+          const pdfData = await pdfParse(buffer);
+          if (pdfData && pdfData.text) cvText = pdfData.text;
+        } catch (e) {
+          // pdf-parse not available or failed; ignore and fallback to deepseek
+          console.warn('pdf-parse unavailable or failed; will fallback to deepseek link', e.message || e);
+        }
+      }
+    } catch (e) {
+      console.warn('error checking uploadedFilePath', e.message || e);
     }
 
-    // If cvText is empty, include deepseekUrl as source for the model to consult (if accessible)
-    const openaiApiKey = process.env.OPENAI_API_KEY;
-    if (!openaiApiKey) return res.status(500).json({ ok: false, error: 'OPENAI_API_KEY not set' });
-
-    // Build explicit, strict instruction to produce full long HTML
-    const systemPrompt = `
-You are a professional web designer and HTML engineer. The user requires a COMPLETE, production-ready, standalone static HTML website created from the candidate's CV.
-Important rules:
-1) Return ONLY ONE single message containing the COMPLETE HTML source code. Start with <!DOCTYPE html> and include <html>, <head>, and <body>.
-2) Inline critical CSS inside a <style> tag in the <head> so the file can be copied and used immediately.
-3) Include subtle animations, accessible layout, sections: Header (name + contact), Summary, Experience, Education, Skills, Projects, and Achievement.
-4) Use the provided CV to fill those website.
-5) Use theme="${themeType}" and colors="${themeColors}". If professional=${professional}, prefer clean typography and spacing.
-6) Keep asset references inline as much as practical. Do not include commentary or any extra JSON—only output the HTML.
-    `.trim();
-
-    // Compose user message with CV contents and optional deepseekUrl
-    const userMessageParts = [];
-    if (cvText && cvText.trim().length > 50) {
-      userMessageParts.push(`CV_TEXT_START\n${cvText}\nCV_TEXT_END`);
-    } else {
-      userMessageParts.push(`CV text could not be extracted from local file. Use the deepseek link below as reference if accessible:\n${deepseekUrl}`);
-    }
-    userMessageParts.push(`Instruction: Create a full, standalone HTML website from the CV above. Use theme: ${themeType}. Colors: ${themeColors}. Professional: ${professional}. Output only the complete HTML markup.`);
-
-    const messages = [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userMessageParts.join('\n\n') }
-    ];
-
-    // Call OpenAI Chat Completions (Chat API)
-    const payload = {
-      model: 'gpt-4o',         // choose a model available to your OpenAI account; replace if needed
-      messages,
-      max_tokens: 6000,
-      temperature: 0.2
-    };
-
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${openaiApiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      console.error('OpenAI error', text);
-      return res.status(500).json({ ok: false, error: 'OpenAI API error', details: text });
+    // 2) If cvText empty, and deepseekUrl provided, fetch and parse DeepSeek share page
+    if ((!cvText || cvText.trim().length < 50) && deepseekUrl) {
+      const dsText = await fetchDeepseekText(deepseekUrl);
+      if (dsText && dsText.trim().length > 10) cvText = dsText;
     }
 
-    const json = await response.json();
-    // Extract assistant content (structure may vary; handle choices[0].message.content)
-    const assistantContent = (json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content) || json.choices && json.choices[0] && json.choices[0].text || null;
-
-    if (!assistantContent) {
-      return res.status(500).json({ ok: false, error: 'No content returned from model', raw: json });
+    // 3) If still empty, try default local path as last resort
+    if ((!cvText || cvText.trim().length < 10) && uploadedFilePath && fs.existsSync(uploadedFilePath)) {
+      // attempt to read as text file
+      try {
+        const raw = fs.readFileSync(uploadedFilePath, 'utf8');
+        cvText = raw;
+      } catch (e) {
+        // binary or unreadable
+      }
     }
 
-    // Return the HTML to frontend
-    return res.json({ ok: true, html: assistantContent });
+    if (!cvText || cvText.trim().length < 30) {
+      // fallback: return an error instructing the user
+      return res.status(400).json({ ok: false, error: 'Could not extract CV text from provided DeepSeek link or uploaded file. Please ensure the DeepSeek link is public share and contains the CV text.' });
+    }
+
+    // 4) Parse sections heuristically and generate full HTML template
+    const sections = parseCvSections(cvText);
+    // include original raw as a fallback
+    sections.raw = cvText;
+
+    const html = generateFullHtml(sections, themeType, themeColors, professional);
+
+    return res.json({ ok: true, html });
   } catch (err) {
-    console.error('Generate endpoint error:', err);
+    console.error('generate error:', err);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// Simple index to check server online
-app.get('/', (req, res) => res.send('HTML Generator backend is running'));
-
+app.get('/', (req, res) => res.send('HTML Generator (DeepSeek mode) running'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
